@@ -148,7 +148,7 @@ def build():
     if size_mb > 30:
         print(f"\nWARNING: Binary size ({size_mb:.1f} MB) exceeds 30 MB target")
     else:
-        print(f"\n✓ Binary size is within 30 MB target")
+        print(f"\n[OK] Binary size is within 30 MB target")
 
     return dst_binary
 
@@ -165,7 +165,7 @@ def verify_binary(binary_path: Path) -> bool:
         print(f"Verification failed: Binary too small ({size_mb:.1f} MB)")
         return False
     
-    print(f"✓ Binary exists and has valid size ({size_mb:.1f} MB)")
+    print(f"[OK] Binary exists and has valid size ({size_mb:.1f} MB)")
     return True
 
 
