@@ -1,0 +1,252 @@
+# Release workflow for Apple TV Remote
+# Triggers on version tags (v*) and builds signed, notarized macOS app
+#
+# Required GitHub Secrets:
+#   APPLE_CERTIFICATE          - Base64 encoded .p12 certificate
+#   APPLE_CERTIFICATE_PASSWORD - Password for .p12 file
+#   APPLE_SIGNING_IDENTITY     - "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID                   - Apple ID email for notarization
+#   APPLE_PASSWORD             - App-specific password for notarization
+#   APPLE_TEAM_ID              - 10-character Team ID
+#   KEYCHAIN_PASSWORD          - Random password for temporary keychain
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Python version for sidecar build
+  PYTHON_VERSION: '3.12'
+  # Node version for frontend
+  NODE_VERSION: '20'
+
+jobs:
+  # Build for macOS (ARM64 + Intel)
+  build-macos:
+    runs-on: macos-14  # Apple Silicon runner
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════════
+      # Environment Setup
+      # ═══════════════════════════════════════════════════════════════
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - name: Cache pnpm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('python/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ═══════════════════════════════════════════════════════════════
+      # Build Python Sidecar
+      # ═══════════════════════════════════════════════════════════════
+      
+      - name: Install Python dependencies
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Python sidecar (ARM64)
+        working-directory: python
+        run: |
+          echo "Building sidecar for aarch64-apple-darwin..."
+          arch -arm64 python build.py
+          # Verify the binary exists
+          ls -la ../src-tauri/binaries/
+
+      - name: Build Python sidecar (x86_64)
+        working-directory: python
+        run: |
+          echo "Building sidecar for x86_64-apple-darwin..."
+          # Force x86_64 architecture
+          arch -x86_64 /usr/bin/python3 -m pip install --upgrade pip
+          arch -x86_64 /usr/bin/python3 -m pip install -r requirements.txt
+          arch -x86_64 /usr/bin/python3 -m pip install pyinstaller
+          arch -x86_64 /usr/bin/python3 build.py
+          # Verify both binaries exist
+          ls -la ../src-tauri/binaries/
+
+      # ═══════════════════════════════════════════════════════════════
+      # Apple Code Signing Setup
+      # ═══════════════════════════════════════════════════════════════
+      
+      - name: Import Apple certificates
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Decode certificate from base64
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          
+          # Create temporary keychain
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          # Import certificate
+          security import certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          
+          # Add keychain to search list
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          
+          # Allow codesign to access the keychain without prompts
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          # Verify certificate is available
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          
+          # Clean up
+          rm certificate.p12
+
+      # ═══════════════════════════════════════════════════════════════
+      # Build & Release
+      # ═══════════════════════════════════════════════════════════════
+      
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Code signing
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Auto-update signing
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Apple TV Remote ${{ github.ref_name }}'
+          releaseBody: |
+            ## What's Changed
+            
+            See the [commits](https://github.com/${{ github.repository }}/compare/.../${{ github.ref_name }}) for details.
+            
+            ## Installation
+            
+            1. Download the `.dmg` file for your Mac
+            2. Open the DMG and drag the app to Applications
+            3. On first launch, right-click and select "Open" if Gatekeeper prompts
+            
+            ## Checksums
+            
+            SHA-256 checksums will be added after release.
+          releaseDraft: true
+          prerelease: false
+          # Build for both architectures
+          args: --target universal-apple-darwin
+          # Generate updater manifest
+          includeUpdaterJson: true
+
+      # ═══════════════════════════════════════════════════════════════
+      # Cleanup
+      # ═══════════════════════════════════════════════════════════════
+      
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+
+  # Optional: Create checksums for release artifacts
+  create-checksums:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          echo "# SHA-256 Checksums" > checksums.txt
+          echo "" >> checksums.txt
+          for file in *.dmg *.app.tar.gz; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" >> checksums.txt
+            fi
+          done
+          cat checksums.txt
+
+      - name: Upload checksums
+        uses: softprops/action-gh-release@v2
+        with:
+          files: checksums.txt
+          draft: true
