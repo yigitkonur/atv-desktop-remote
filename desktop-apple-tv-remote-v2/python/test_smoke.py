@@ -81,22 +81,30 @@ def get_binary_path() -> Path:
     )
 
 
-def read_stderr_async(proc: subprocess.Popen, queue: Queue):
-    """Read stderr in a separate thread to avoid blocking."""
+def read_stream_async(stream, queue: Queue, name: str):
+    """Read a stream in a separate thread to avoid blocking."""
     try:
-        for line in iter(proc.stderr.readline, b''):
+        for line in iter(stream.readline, b''):
             if line:
-                queue.put(line.decode('utf-8', errors='replace'))
+                queue.put((name, line.decode('utf-8', errors='replace')))
     except Exception as e:
-        queue.put(f'[STDERR READ ERROR] {e}')
+        queue.put((name, f'[{name.upper()} READ ERROR] {e}'))
 
 
 def test_binary_startup(binary_path: Path) -> subprocess.Popen:
     """
     Test 1: Binary starts and emits 'ready' event.
     Returns the running process for further tests.
+    
+    Note: The ready event is emitted to stderr as "[EMIT] ready:" and also
+    as a JSON-RPC event to stdout. We check both for cross-platform compatibility.
     """
     print(f'[TEST 1] Starting binary: {binary_path}')
+    
+    # On Windows, use CREATE_NO_WINDOW to prevent console window popup
+    creationflags = 0
+    if platform.system().lower() == 'windows':
+        creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
     
     # Start the process
     proc = subprocess.Popen(
@@ -105,38 +113,52 @@ def test_binary_startup(binary_path: Path) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,  # Unbuffered
+        creationflags=creationflags,
     )
     
-    # Read stderr in background thread
-    stderr_queue: Queue = Queue()
-    stderr_thread = Thread(target=read_stderr_async, args=(proc, stderr_queue), daemon=True)
+    # Read both stdout and stderr in background threads
+    output_queue: Queue = Queue()
+    stderr_thread = Thread(target=read_stream_async, args=(proc.stderr, output_queue, 'stderr'), daemon=True)
+    stdout_thread = Thread(target=read_stream_async, args=(proc.stdout, output_queue, 'stdout'), daemon=True)
     stderr_thread.start()
+    stdout_thread.start()
     
-    # Wait for 'ready' event
+    # Wait for 'ready' event (can come from either stderr or stdout)
     start_time = time.time()
     stderr_lines = []
+    stdout_lines = []
     ready_received = False
     
     while time.time() - start_time < STARTUP_TIMEOUT:
         # Check if process died
         if proc.poll() is not None:
-            # Collect remaining stderr
-            while not stderr_queue.empty():
+            # Collect remaining output
+            time.sleep(0.5)  # Give threads time to flush
+            while not output_queue.empty():
                 try:
-                    stderr_lines.append(stderr_queue.get_nowait())
+                    stream_name, line = output_queue.get_nowait()
+                    if stream_name == 'stderr':
+                        stderr_lines.append(line)
+                    else:
+                        stdout_lines.append(line)
                 except Empty:
                     break
-            stderr_output = ''.join(stderr_lines)
             print(f'[FAIL] Process exited with code {proc.returncode}')
-            print(f'[STDERR]\n{stderr_output}')
+            print(f'[STDERR]\n{"".join(stderr_lines)}')
+            print(f'[STDOUT]\n{"".join(stdout_lines)}')
             sys.exit(1)
         
-        # Check for ready event in stderr
+        # Check for ready event in either stream
         try:
-            line = stderr_queue.get(timeout=0.5)
-            stderr_lines.append(line)
-            print(f'  [stderr] {line.rstrip()}')
+            stream_name, line = output_queue.get(timeout=0.5)
+            if stream_name == 'stderr':
+                stderr_lines.append(line)
+                print(f'  [stderr] {line.rstrip()}')
+            else:
+                stdout_lines.append(line)
+                print(f'  [stdout] {line.rstrip()[:80]}...' if len(line) > 80 else f'  [stdout] {line.rstrip()}')
             
+            # Check for ready in either stream
             if 'ready' in line.lower() or '"ready"' in line:
                 ready_received = True
                 print('[PASS] Ready event received')
@@ -145,15 +167,16 @@ def test_binary_startup(binary_path: Path) -> subprocess.Popen:
             pass
     
     if not ready_received:
-        stderr_output = ''.join(stderr_lines)
         print(f'[FAIL] Timeout waiting for ready event ({STARTUP_TIMEOUT}s)')
-        print(f'[STDERR]\n{stderr_output}')
+        print(f'[STDERR lines: {len(stderr_lines)}]\n{"".join(stderr_lines)}')
+        print(f'[STDOUT lines: {len(stdout_lines)}]\n{"".join(stdout_lines)}')
         proc.terminate()
         sys.exit(1)
     
-    # Store stderr lines for later analysis
+    # Store output for later analysis
     proc._stderr_lines = stderr_lines  # type: ignore
-    proc._stderr_queue = stderr_queue  # type: ignore
+    proc._stdout_lines = stdout_lines  # type: ignore
+    proc._output_queue = output_queue  # type: ignore
     
     return proc
 
@@ -263,17 +286,23 @@ def test_no_import_errors(proc: subprocess.Popen) -> None:
     print('[TEST 3] Checking for import errors')
     
     stderr_lines = getattr(proc, '_stderr_lines', [])
-    stderr_queue = getattr(proc, '_stderr_queue', None)
+    stdout_lines = getattr(proc, '_stdout_lines', [])
+    output_queue = getattr(proc, '_output_queue', None)
     
-    # Collect any remaining stderr
-    if stderr_queue:
-        while not stderr_queue.empty():
+    # Collect any remaining output
+    if output_queue:
+        while not output_queue.empty():
             try:
-                stderr_lines.append(stderr_queue.get_nowait())
+                stream_name, line = output_queue.get_nowait()
+                if stream_name == 'stderr':
+                    stderr_lines.append(line)
+                else:
+                    stdout_lines.append(line)
             except Empty:
                 break
     
-    stderr_output = ''.join(stderr_lines)
+    # Check both stdout and stderr for import errors
+    all_output = ''.join(stderr_lines) + ''.join(stdout_lines)
     
     error_patterns = [
         'ModuleNotFoundError',
@@ -284,9 +313,9 @@ def test_no_import_errors(proc: subprocess.Popen) -> None:
     
     found_errors = []
     for pattern in error_patterns:
-        if pattern in stderr_output:
+        if pattern in all_output:
             # Find the actual line with the error
-            for line in stderr_lines:
+            for line in stderr_lines + stdout_lines:
                 if pattern in line:
                     found_errors.append(line.strip())
     
